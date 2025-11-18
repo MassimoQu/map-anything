@@ -1,0 +1,22 @@
+defaults:
+  - default
+  - opv2v: default
+
+num_views: 4
+
+train:
+  variable_num_views: false
+val:
+  variable_num_views: false
+test:
+  variable_num_views: false
+
+resolution_train: ${dataset.resolution_options.518_1_33_ar}
+resolution_val: ${dataset.resolution_options.518_1_33_ar}
+
+train_dataset:
+  "+ 20_000 @ ${dataset.opv2v.train.dataset_str}"
+
+test_dataset:
+  "+ 1_000 @ ${dataset.opv2v.val.dataset_str}
+  + 1_000 @ ${dataset.opv2v.test.dataset_str}"

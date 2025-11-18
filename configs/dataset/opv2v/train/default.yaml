@@ -1,0 +1,22 @@
+dataset_str:
+  "OPV2VDataset(
+    split='${dataset.opv2v.train.split}',
+    ROOT='${dataset.opv2v.images_root}',
+    depth_root='${dataset.opv2v.depth_root}',
+    camera_ids=${dataset.opv2v.camera_ids},
+    num_views=${dataset.num_views},
+    variable_num_views=${dataset.train.variable_num_views},
+    resolution=${dataset.opv2v.train.dataset_resolution},
+    principal_point_centered=${dataset.principal_point_centered},
+    transform='${dataset.opv2v.train.transform}',
+    data_norm_type='${dataset.opv2v.train.data_norm_type}',
+    aug_crop=${dataset.opv2v.train.aug_crop},
+    seed=${dataset.opv2v.train.seed},
+    max_num_retries=${dataset.opv2v.train.max_num_retries})"
+split: ${dataset.opv2v.split_names.train}
+dataset_resolution: ${dataset.resolution_train}
+transform: 'colorjitter+grayscale+gaublur'
+data_norm_type: ${model.data_norm_type}
+aug_crop: 16
+seed: 777
+max_num_retries: 1

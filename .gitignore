@@ -1,11 +1,21 @@
-# Local Files
+# Project-specific artifacts
+.idea/
+experiments/
+local_models/
 outputs/
 checkpoints/
 local/
 wandb/
-data_processing/wai_processing/third_party
 hydra/
 private/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.log
+events.out.tfevents.*
+data_processing/wai_processing/third_party
+.DS_Store
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

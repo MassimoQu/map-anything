@@ -1,0 +1,13 @@
+defaults:
+  - train: default
+  - val: default
+  - test: default
+
+split_names:
+  train: train
+  val: validate
+  test: test
+
+images_root: ${machine.opv2v_images_root}
+depth_root: ${machine.opv2v_depth_root}
+camera_ids: [0, 1, 2, 3]
