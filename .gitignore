@@ -8,6 +8,7 @@ local/
 wandb/
 hydra/
 private/
+eval_runs/
 *.pt
 *.pth
 *.ckpt

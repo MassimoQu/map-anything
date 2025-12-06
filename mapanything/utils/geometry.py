@@ -9,6 +9,7 @@ Utilities for geometry operations.
 References: DUSt3R, MoGe
 """
 
+import math
 from numbers import Number
 from typing import Tuple, Union
 
@@ -1365,6 +1366,134 @@ def get_absolute_pointmaps_and_rays_info(
         ray_directions_cam,
         pts_cam,
     )
+
+
+def _parse_cylindrical_camera_parameters(virtual_camera):
+    """
+    Extract cylindrical camera parameters with sensible defaults.
+    """
+    if virtual_camera is None:
+        raise ValueError("virtual_camera configuration must be provided for cylindrical projection.")
+
+    h_fov = float(virtual_camera.get("h_fov", 2 * math.pi))
+    azimuth_offset = float(virtual_camera.get("azimuth_offset", 0.0))
+    if "elevation_min" in virtual_camera and "elevation_max" in virtual_camera:
+        elevation_min = float(virtual_camera["elevation_min"])
+        elevation_max = float(virtual_camera["elevation_max"])
+    else:
+        v_fov = float(virtual_camera.get("v_fov", math.pi / 2))
+        elevation_center = float(virtual_camera.get("elevation_center", 0.0))
+        elevation_min = elevation_center - v_fov / 2
+        elevation_max = elevation_center + v_fov / 2
+    if elevation_max <= elevation_min:
+        raise ValueError("elevation_max must be greater than elevation_min for cylindrical camera.")
+    return h_fov, azimuth_offset, elevation_min, elevation_max
+
+
+def _generate_cylindrical_ray_directions(width, height, virtual_camera):
+    """
+    Generate unit ray directions for a virtual cylindrical camera.
+    """
+    h_fov, azimuth_offset, elevation_min, elevation_max = _parse_cylindrical_camera_parameters(
+        virtual_camera
+    )
+
+    # Pixel centers mapped to azimuth/elevation
+    u = (np.arange(width, dtype=np.float32) + 0.5) / float(width)
+    azimuth = (u - 0.5) * h_fov + azimuth_offset  # [-h_fov/2, h_fov/2]
+    v = (np.arange(height, dtype=np.float32) + 0.5) / float(height)
+    elevation = elevation_max - v * (elevation_max - elevation_min)  # top -> max
+
+    azimuth_grid, elevation_grid = np.meshgrid(azimuth, elevation, indexing="xy")
+    cos_elev = np.cos(elevation_grid)
+    sin_elev = np.sin(elevation_grid)
+
+    ray_dirs_cam = np.stack(
+        (
+            cos_elev * np.sin(azimuth_grid),
+            -sin_elev,
+            cos_elev * np.cos(azimuth_grid),
+        ),
+        axis=-1,
+    )
+    ray_dirs_cam = ray_dirs_cam.astype(np.float32)
+    ray_norm = np.linalg.norm(ray_dirs_cam, axis=-1, keepdims=True).clip(min=1e-8)
+    ray_dirs_cam /= ray_norm
+    return ray_dirs_cam
+
+
+def get_cylindrical_pointmaps_and_rays_info(
+    depthmap,
+    camera_pose,
+    virtual_camera,
+    **kw,
+):
+    """
+    Equivalent of get_absolute_pointmaps_and_rays_info for cylindrical projections.
+    """
+    if depthmap.ndim == 3 and depthmap.shape[-1] == 1:
+        depthmap = depthmap[..., 0]
+    depthmap = depthmap.astype(np.float32)
+    height, width = depthmap.shape
+
+    ray_directions_cam = _generate_cylindrical_ray_directions(width, height, virtual_camera)
+    pts3d_cam = depthmap[..., None] * ray_directions_cam
+
+    depth_along_ray = np.linalg.norm(pts3d_cam, axis=-1, keepdims=True)
+    valid_mask = depthmap > 0.0
+
+    ray_origins_world = np.zeros_like(ray_directions_cam)
+    ray_directions_world = ray_directions_cam
+    pts_world = pts3d_cam
+
+    if camera_pose is not None:
+        R_cam2world = camera_pose[:3, :3].astype(np.float32)
+        t_cam2world = camera_pose[:3, 3].astype(np.float32)
+        ray_origins_world = np.broadcast_to(t_cam2world, ray_directions_cam.shape).copy()
+        ray_directions_world = np.einsum("ij,hwj->hwi", R_cam2world, ray_directions_cam)
+        pts_world = np.einsum("ij,hwj->hwi", R_cam2world, pts3d_cam) + ray_origins_world
+
+    return (
+        pts_world,
+        valid_mask,
+        ray_origins_world,
+        ray_directions_world,
+        depth_along_ray,
+        ray_directions_cam,
+        pts3d_cam,
+    )
+
+
+def get_pointmaps_and_rays_info(camera_model=None, **kwargs):
+    """
+    Dispatch helper to compute pointmaps/rays for different camera models.
+    """
+    cam_model = (camera_model or "pinhole").lower()
+    working_kwargs = dict(kwargs)
+    working_kwargs.pop("camera_model", None)
+
+    if cam_model in ("cyl", "cylindrical"):
+        virtual_camera = working_kwargs.pop("virtual_camera", None)
+        if virtual_camera is None:
+            raise ValueError("virtual_camera must be provided for cylindrical camera_model.")
+        depthmap = working_kwargs.pop("depthmap")
+        camera_pose = working_kwargs.pop("camera_pose", None)
+        return get_cylindrical_pointmaps_and_rays_info(
+            depthmap=depthmap,
+            camera_pose=camera_pose,
+            virtual_camera=virtual_camera,
+        )
+    elif cam_model in ("pinhole", "perspective"):
+        depthmap = working_kwargs.pop("depthmap")
+        camera_intrinsics = working_kwargs.pop("camera_intrinsics")
+        camera_pose = working_kwargs.pop("camera_pose", None)
+        return get_absolute_pointmaps_and_rays_info(
+            depthmap=depthmap,
+            camera_intrinsics=camera_intrinsics,
+            camera_pose=camera_pose,
+        )
+    else:
+        raise ValueError(f"Unsupported camera_model '{camera_model}'.")
 
 
 def adjust_camera_params_for_rotation(camera_params, original_size, k):

@@ -1,0 +1,22 @@
+defaults:
+  - default
+  - opv2v: cyl_coop
+
+num_views: 4
+
+train:
+  variable_num_views: true
+val:
+  variable_num_views: false
+test:
+  variable_num_views: false
+
+resolution_train: ${dataset.opv2v.train.panorama_resolution}
+resolution_val: ${dataset.opv2v.val.panorama_resolution}
+
+train_dataset:
+  "+ 40_000 @ ${dataset.opv2v.train.dataset_str}"
+
+test_dataset:
+  "+ 1_000 @ ${dataset.opv2v.val.dataset_str}
+  + 1_000 @ ${dataset.opv2v.test.dataset_str}"

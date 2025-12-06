@@ -24,7 +24,7 @@ from mapanything.utils.cropping import (
 )
 from mapanything.utils.geometry import (
     depthmap_to_camera_coordinates,
-    get_absolute_pointmaps_and_rays_info,
+    get_pointmaps_and_rays_info,
 )
 from uniception.models.encoders.image_normalizations import IMAGE_NORMALIZATION_DICT
 
@@ -143,6 +143,9 @@ class BaseDataset(EasyDataset):
         # Initialize the dataset type flags
         self.is_metric_scale = False  # by default a dataset is not metric scale, subclasses can overwrite this
         self.is_synthetic = False  # by default a dataset is not synthetic, subclasses can overwrite this
+        # Allow datasets to relax the strict view count check when they can return a variable number of views
+        self.allow_variable_view_count = False
+        self.min_num_views_allowed = 2
 
     def _load_data(self):
         self.scenes = []
@@ -481,16 +484,22 @@ class BaseDataset(EasyDataset):
         else:
             num_views_to_sample = self.num_views[num_views_to_sample_idx]
         views = self._get_views(idx, num_views_to_sample, resolution)
-        if isinstance(self.num_views, int):
-            assert len(views) == self.num_views
+        if self.allow_variable_view_count:
+            assert len(views) >= self.min_num_views_allowed, (
+                f"Expected at least {self.min_num_views_allowed} views, got {len(views)}"
+            )
         else:
-            assert len(views) in self.num_views
+            if isinstance(self.num_views, int):
+                assert len(views) == self.num_views
+            else:
+                assert len(views) in self.num_views
 
         for v, view in enumerate(views):
             # Store the index and other metadata
             view["idx"] = (idx, ar_idx, v)
             view["is_metric_scale"] = self.is_metric_scale
             view["is_synthetic"] = self.is_synthetic
+            view.setdefault("camera_model", "pinhole")
 
             # Check the depth, intrinsics, and pose data (also other data if present)
             assert "camera_intrinsics" in view
@@ -521,6 +530,9 @@ class BaseDataset(EasyDataset):
             view["data_norm_type"] = self.data_norm_type
 
             # Compute the pointmaps, raymap and depth along ray
+            camera_model = view.get("camera_model")
+            pointmap_inputs = dict(view)
+            pointmap_inputs.pop("camera_model", None)
             (
                 pts3d,
                 valid_mask,
@@ -529,7 +541,11 @@ class BaseDataset(EasyDataset):
                 depth_along_ray,
                 ray_directions_cam,
                 pts3d_cam,
-            ) = get_absolute_pointmaps_and_rays_info(**view)
+            ) = get_pointmaps_and_rays_info(
+                camera_model=camera_model, **pointmap_inputs
+            )
+            if view.get("camera_model") not in ("pinhole", "perspective"):
+                view.pop("virtual_camera", None)
             view["pts3d"] = pts3d
             view["valid_mask"] = valid_mask & np.isfinite(pts3d).all(axis=-1)
             view["depth_along_ray"] = depth_along_ray

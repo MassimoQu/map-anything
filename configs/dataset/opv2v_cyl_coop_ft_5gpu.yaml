@@ -1,0 +1,25 @@
+defaults:
+  - default
+  - opv2v: cyl_coop
+
+# 使用 5 张 GPU 时，为了保持每个 epoch ≈5000 step，需要将 ResizedDataset 的目标长度改为 50_000。
+# 这等价于把基础 OPV2V 场景重复采样到 5 万条样本，以配合 dynamic sampler 在 max_batch=2 时
+# 仍能生成 25_000 个 batch（25k / world_size=5 => 5000 step）。
+num_views: 4
+
+train:
+  variable_num_views: true
+val:
+  variable_num_views: false
+test:
+  variable_num_views: false
+
+resolution_train: ${dataset.opv2v.train.panorama_resolution}
+resolution_val: ${dataset.opv2v.val.panorama_resolution}
+
+train_dataset:
+  "+ 50_000 @ ${dataset.opv2v.train.dataset_str}"
+
+test_dataset:
+  "+ 1_000 @ ${dataset.opv2v.val.dataset_str}
+  + 1_000 @ ${dataset.opv2v.test.dataset_str}"

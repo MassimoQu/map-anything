@@ -1,0 +1,31 @@
+defaults:
+  - default
+
+num_views: 2
+train:
+  variable_num_views: false
+val:
+  variable_num_views: false
+test:
+  variable_num_views: false
+
+resolution_train: [64, 48]
+resolution_val: [64, 48]
+
+train_dataset:
+  "+ 2 @ OPV2VDataset(
+    split='train',
+    ROOT='tests/fixtures/sample_opv2v/opv2v_images',
+    depth_root='tests/fixtures/sample_opv2v/opv2v_depth',
+    camera_ids=(0, 1),
+    num_views=${dataset.num_views},
+    variable_num_views=${dataset.train.variable_num_views},
+    resolution=${dataset.resolution_train},
+    principal_point_centered=false,
+    transform='imgnorm',
+    data_norm_type='dinov2',
+    aug_crop=0,
+    seed=0,
+    max_num_retries=0)"
+
+test_dataset: "[null]"

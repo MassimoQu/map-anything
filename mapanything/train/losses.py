@@ -659,6 +659,8 @@ class NonAmbiguousMaskLoss(Criterion, MultiLoss):
         loss_list = []
         mask_loss_details = {}
         mask_loss_total = 0
+        pred_mask_mean_total = 0.0
+        gt_mask_mean_total = 0.0
         self_name = type(self).__name__
 
         # Loop over the views
@@ -679,8 +681,19 @@ class NonAmbiguousMaskLoss(Criterion, MultiLoss):
             mask_loss_details[f"{self_name}_mask_view{view_idx + 1}"] = float(loss)
             mask_loss_total += float(loss)
 
+            # Track sigmoid statistics for monitoring collapse
+            mask_prob = torch.sigmoid(pred_non_ambiguous_mask_logits)
+            pred_mask_mean_total += float(mask_prob.mean())
+            gt_mask_mean_total += float(gt_non_ambiguous_mask.float().mean())
+
         # Compute the average loss across all views
         mask_loss_details[f"{self_name}_mask_avg"] = mask_loss_total / len(batch)
+        mask_loss_details[f"{self_name}_pred_mask_mean"] = (
+            pred_mask_mean_total / len(batch)
+        )
+        mask_loss_details[f"{self_name}_gt_mask_mean"] = (
+            gt_mask_mean_total / len(batch)
+        )
 
         return Sum(*loss_list), (mask_loss_details | {})
 
