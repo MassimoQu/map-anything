@@ -602,7 +602,11 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                 print(
                     f"Loading pretrained MapAnything weights from {self.pretrained_checkpoint_path} ..."
                 )
-                ckpt = torch.load(self.pretrained_checkpoint_path, weights_only=False)
+                ckpt = torch.load(
+                    self.pretrained_checkpoint_path,
+                    map_location="cpu",
+                    weights_only=False,
+                )
                 print(self.load_state_dict(ckpt["model"]))
             else:
                 print(
@@ -611,7 +615,11 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                 assert self.pred_head_type is not None, (
                     "Specific submodules to load cannot be None."
                 )
-                ckpt = torch.load(self.pretrained_checkpoint_path, weights_only=False)
+                ckpt = torch.load(
+                    self.pretrained_checkpoint_path,
+                    map_location="cpu",
+                    weights_only=False,
+                )
                 filtered_ckpt = {}
                 for ckpt_key, ckpt_value in ckpt["model"].items():
                     for submodule in self.specific_pretrained_submodules:
@@ -2068,6 +2076,8 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                 "idx",
                 "true_shape",
                 "data_norm_type",
+                "camera_model",
+                "virtual_camera",
             ]
         )
         for view in validated_views:
