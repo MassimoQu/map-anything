@@ -6,8 +6,11 @@ outputs/
 checkpoints/
 local/
 wandb/
+data/
+depth/
 hydra/
 private/
+.ruff_cache/
 eval_runs/
 *.pt
 *.pth
