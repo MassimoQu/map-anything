@@ -1525,7 +1525,13 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
 
         return dense_final_outputs, pose_final_outputs, scale_final_output
 
-    def forward(self, views, memory_efficient_inference=False, minibatch_size=None):
+    def forward(
+        self,
+        views,
+        memory_efficient_inference=False,
+        minibatch_size=None,
+        return_features: bool = False,
+    ):
         """
         Forward pass performing the following operations:
         1. Encodes the N input views (images).
@@ -1551,6 +1557,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                                     "is_metric_scale" (tensor): Boolean tensor indicating whether the geometric inputs are in metric scale or not. Tensor of shape (B, 1).
             memory_efficient_inference (bool): Whether to use memory efficient inference or not. This runs the dense prediction head (the memory bottleneck) in a memory efficient manner. Default is False.
             minibatch_size (int): Optional fixed minibatch size for memory-efficient inference. If provided, uses the specified minibatch size instead of computing it adaptively based on available GPU memory. Defaults to None (adaptive).
+            return_features (bool): Whether to return intermediate features for analysis. Default is False.
 
         Returns:
             List[dict]: A list containing the final outputs for all N views.
@@ -1592,6 +1599,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         intermediate_info_sharing_multi_view_feat = None
         if self.info_sharing_return_type == "no_intermediate_features":
             final_info_sharing_multi_view_feat = self.info_sharing(info_sharing_input)
+            intermediate_info_sharing_multi_view_feat = None
         elif self.info_sharing_return_type == "intermediate_features":
             (
                 final_info_sharing_multi_view_feat,
@@ -1964,6 +1972,18 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                     res[i]["non_ambiguous_mask"] = output_masks_per_view[i]
                     res[i]["non_ambiguous_mask_logits"] = output_mask_logits_per_view[i]
 
+        if return_features:
+            return (
+                res,
+                {
+                    "encoder_features": all_encoder_features_across_views,
+                    "final_features": final_info_sharing_multi_view_feat.features,
+                    "intermediate_features": intermediate_info_sharing_multi_view_feat,
+                    "scale_tokens": final_info_sharing_multi_view_feat.additional_token_features,
+                    "img_shape": img_shape,
+                },
+            )
+
         return res
 
     def _configure_geometric_input_config(
@@ -2116,7 +2136,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             if amp_dtype == "fp16":
                 amp_dtype = torch.float16
             elif amp_dtype == "bf16":
-                if torch.cuda.is_bf16_supported():
+                if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
                     amp_dtype = torch.bfloat16
                 else:
                     warnings.warn(

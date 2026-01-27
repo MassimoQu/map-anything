@@ -23,6 +23,7 @@ from mapanything.datasets.wai.sailvos3d import SAILVOS3DWAI  # noqa
 from mapanything.datasets.wai.scannetpp import ScanNetPPWAI  # noqa
 from mapanything.datasets.wai.spring import SpringWAI  # noqa
 from mapanything.datasets.wai.tav2_wb import TartanAirV2WBWAI  # noqa
+from mapanything.datasets.opv2v import OPV2VDataset, OPV2VCoopDataset  # noqa
 from mapanything.datasets.wai.unrealstereo4k import UnrealStereo4KWAI  # noqa
 from mapanything.datasets.opv2v import OPV2VCoopDataset, OPV2VDataset  # noqa
 from mapanything.datasets.opv2v_cyl import (  # noqa

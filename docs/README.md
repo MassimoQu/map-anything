@@ -1,14 +1,30 @@
-# mapanything_ft/docs 导航（精简版）
+# Map-Anything 文档导航（分层版）
 
-> 以圆柱 4n→n 方案为唯一主线；上游通用 OPV2V 评测/训练/可视化文档已移入 `archive/upstream/` 仅供参考。
+> 先看“必读三件套”，再按子目录查详情；过期内容集中在 `archive/`。
 
-## 主线（需要维护）
-- `cyl/multi_car_training_plan.md`：圆柱全景聚合方案与实现细节。
-- `cyl/opv2v_cyl_coop_debug_plan.md`：圆柱训练调试 checklist（环境/步数/遮挡 mask 等）。
-- `assets/`：配套图示（若仅服务上游文档，可后续迁入 `archive/`）。
+## 顶层
+- `opv2v_docs_consolidated.md`：权威入口，写明最新结论/优先级/归档。
 
-## 归档
-- `archive/upstream/`：上游 OPV2V 评测/训练/可视化文档备份（image-only、Vehicle-ID、可视化等，数字可能过期）。
-- `archive/` 其它文件：旧报告/流程，慎用厘米级数字。
+## 必读三件套（5 分钟上手）
+- `opv2v_docs_consolidated.md`（本文件夹根）
+- `eval/opv2v_batch_eval_analysis_image_only.md`：标准评测流程 + 数字（剥离外参/深度）。
+- `training/opv2v_coop_training_summary.md`：Stage1/2/3 训练命令与依赖。
 
-新增或更新圆柱方案时，请同步维护 `cyl/`；上游通用流程建议参考 map-anything 分支，以免双份漂移。***
+## 目录速览
+- `eval/`：评测与假设  
+  - `opv2v_eval_report_image_only.md`（汇报版数值）  
+  - `pose_evaluation_issue.md`（必须 strip 外参/深度的原因）
+- `training/`：训练改进 / 方案  
+  - `opv2v_training_upgrade_plan.md`（mask-aware 深度/尺度蒸馏/多车一致性）  
+  - `opv2v_vehicle_id_adaptation.md`（多车身份嵌入）  
+  - `opv2v_unified_notes.md`（数据/环境/流程一页纸）
+- `viz/`：可视化  
+  - `opv2v_visualization_core_summary.md`（脚本与依赖拆解）  
+  - `opv2v_pointcloud_visualization.md`（无头查看/HTML 发布指南）
+- `assets/`：配套图示
+- `archive/`：早期含外参/深度泄漏或流程过期的文档（见 `archive/README.md`）
+
+## 相关外部文档
+- 圆柱 4n→n 多车方案与调试：`mapanything_ft/docs/`（活跃，见其 README）。
+
+新增评测/方案时：更新本导航，必要时把旧文档移入 `archive/` 并注明日期/范围。***

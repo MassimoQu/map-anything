@@ -10,6 +10,8 @@ Helper functions for HuggingFace integration and model initialization.
 import json
 import os
 
+from omegaconf import DictConfig, OmegaConf
+
 
 def load_hf_token():
     """Load HuggingFace access token from local file"""
@@ -219,6 +221,8 @@ def initialize_mapanything_local(local_config, device):
 
     if model_config is None:
         model_config = local_config.get("model_config", cfg.model.model_config)
+    elif not isinstance(model_config, DictConfig):
+        model_config = OmegaConf.create(model_config)
 
     torch_hub_force_reload = local_config.get("torch_hub_force_reload", False)
 

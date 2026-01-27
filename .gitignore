@@ -187,3 +187,5 @@ cython_debug/
 
 # VSCode
 .vscode
+
+visualization_outputs/

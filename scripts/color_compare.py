@@ -4,13 +4,22 @@
 import argparse
 import logging
 import math
+import shlex
+import sys
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, TextIO, Tuple
 
 import numpy as np
 import torch
 import yaml
 from PIL import Image
+try:
+    from scipy.spatial.transform import Rotation
+except ImportError as exc:
+    raise ImportError(
+        "scipy is required for pose conversions. Please install it via 'pip install scipy'."
+    ) from exc
 
 from mapanything.utils.hf_utils.hf_helpers import initialize_mapanything_local
 from mapanything.utils.image import load_images, rgb, preprocess_inputs
@@ -31,36 +40,116 @@ DEFAULT_CONFIG_OVERRIDES = [
     "model.encoder.uses_torch_hub=false",
 ]
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg")
+YAML_EXTENSIONS = (".yaml", ".yml")
+CARLA_TO_CAMERA_CV = torch.tensor(
+    [
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, -1.0, 0.0],
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ],
+    dtype=torch.float32,
+)
+CV_TO_UE_TRANSFORM = np.array(
+    [
+        [0.0, 0.0, 1.0, 0.0],
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, -1.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ],
+    dtype=np.float32,
+)
+CV_TO_UE_ROTATION = CV_TO_UE_TRANSFORM[:3, :3]
+
+
+class PoseLogSink:
+    """Simple sink that mirrors pose-related logs into a file."""
+
+    def __init__(self, path: Optional[Path]):
+        self.path = path
+        self._fh: Optional[TextIO] = None
+        if path is not None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self._fh = path.open("a", encoding="utf-8")
+
+    def log_lines(self, lines: Iterable[str]) -> None:
+        if not self._fh:
+            return
+        for line in lines:
+            self._fh.write(f"{line}\n")
+        self._fh.flush()
+
+    def log_run_header(self, command_line: str) -> None:
+        if not self._fh:
+            return
+        timestamp = datetime.now().isoformat(timespec="seconds")
+        separator = "=" * 80
+        self.log_lines(
+            [
+                "",
+                separator,
+                f"Run started: {timestamp}",
+                f"Command: {command_line}",
+                separator,
+            ]
+        )
+
+    def close(self) -> None:
+        if self._fh:
+            self._fh.close()
+            self._fh = None
+
+
+def _maybe_log_lines(pose_log_sink: Optional[PoseLogSink], lines: Iterable[str]) -> None:
+    if pose_log_sink is not None:
+        pose_log_sink.log_lines(lines)
+
+
+CALIBRATION_KEYS_TO_DROP = {
+    "intrinsics",
+    "camera_poses",
+    "camera_pose_quats",
+    "camera_pose_trans",
+    "ray_directions",
+    "ray_directions_cam",
+}
+
+
+def strip_external_calibration_inputs(views: List[Dict[str, Any]]) -> None:
+    """
+    Remove externally provided calibration (poses/intrinsics/ray dirs) so inference stays image-only.
+    Operates in-place on the provided list of view dictionaries.
+    """
+    for view in views:
+        for key in CALIBRATION_KEYS_TO_DROP:
+            if key in view:
+                view.pop(key)
 
 
 def ue_c2w_to_opencv_c2w(C2W_ue: torch.Tensor) -> torch.Tensor:
     """
-    Convert a Carla/UE camera-to-frame transform into the OpenCV (right-handed) convention.
-    Matches the helper used inside scripts/depth_ge.py.
+    Convert a Carla/UE camera-to-frame transform into the OpenCV (right-handed) convention
+    using the CARLA→OpenCV change-of-basis matrix.
     """
     if C2W_ue.shape != (4, 4):
         raise ValueError(f"Expected 4x4 matrix, got {C2W_ue.shape}")
 
-    S = torch.tensor(
-        [
-            [0.0, 1.0, 0.0],
-            [0.0, 0.0, -1.0],
-            [1.0, 0.0, 0.0],
-        ],
-        dtype=torch.float32,
-        device=C2W_ue.device,
-    )
+    converter = CARLA_TO_CAMERA_CV.to(C2W_ue.device)
+    converter_inv = converter.t()
+    return converter @ C2W_ue @ converter_inv
 
-    R_ue = C2W_ue[:3, :3]
-    t_ue = C2W_ue[:3, 3]
 
-    R_cv = S @ R_ue @ S.t()
-    t_cv = S @ t_ue
+def _angles_to_rotation(angles_deg: Iterable[float]) -> np.ndarray:
+    """Convert [roll, yaw, pitch] angles (degrees) into a Carla-style rotation matrix."""
+    angles_deg = list(angles_deg)
+    if len(angles_deg) != 3:
+        raise ValueError(f"Expected 3 angles, got {len(angles_deg)}")
 
-    C2W_cv = torch.eye(4, dtype=torch.float32, device=C2W_ue.device)
-    C2W_cv[:3, :3] = R_cv
-    C2W_cv[:3, 3] = t_cv
-    return C2W_cv
+    roll_deg, yaw_deg, pitch_deg = angles_deg
+    # Carla stores rotations as yaw(Z) → pitch(Y) → roll(X). The equivalent SciPy call
+    # is intrinsic order "zyx" with angles [yaw, pitch, roll].
+    rot = Rotation.from_euler("zyx", [yaw_deg, pitch_deg, roll_deg], degrees=True)
+    return rot.as_matrix().astype(np.float32)
 
 
 def rescale_intrinsics_to_image(K: torch.Tensor, img_w: int, img_h: int) -> torch.Tensor:
@@ -93,40 +182,18 @@ def rescale_intrinsics_to_image(K: torch.Tensor, img_w: int, img_h: int) -> torc
     return K
 
 
-def pose_list_to_matrix(pose: List[float], device: torch.device) -> torch.Tensor:
+def cords_to_pose_matrix(cords: Iterable[float], device: torch.device) -> torch.Tensor:
     """
-    Convert [x, y, z, roll, yaw, pitch] (degrees) to a 4x4 SE(3) matrix following the Carla convention (Z-Y-X order).
+    Transform OPV2V ``cords`` arrays ([x, y, z, roll, yaw, pitch]) into 4x4 homogeneous matrices.
     """
-    if len(pose) < 6:
-        raise ValueError(f"Pose must contain 6 values, got {pose}")
-    x, y, z, roll_deg, yaw_deg, pitch_deg = pose[:6]
+    values = list(cords)
+    if len(values) != 6:
+        raise ValueError(f"Expected 6 values for pose, received {len(values)}")
 
-    roll = math.radians(roll_deg)
-    yaw = math.radians(yaw_deg)
-    pitch = math.radians(pitch_deg)
-
-    c_y = math.cos(yaw)
-    s_y = math.sin(yaw)
-    c_r = math.cos(roll)
-    s_r = math.sin(roll)
-    c_p = math.cos(pitch)
-    s_p = math.sin(pitch)
-
-    mat = torch.eye(4, dtype=torch.float32, device=device)
-    mat[0, 3] = x
-    mat[1, 3] = y
-    mat[2, 3] = z
-
-    mat[0, 0] = c_y * c_p
-    mat[0, 1] = c_y * s_p * s_r - s_y * c_r
-    mat[0, 2] = c_y * s_p * c_r + s_y * s_r
-    mat[1, 0] = s_y * c_p
-    mat[1, 1] = s_y * s_p * s_r + c_y * c_r
-    mat[1, 2] = s_y * s_p * c_r - c_y * s_r
-    mat[2, 0] = -s_p
-    mat[2, 1] = c_p * s_r
-    mat[2, 2] = c_p * c_r
-    return mat
+    pose_np = np.eye(4, dtype=np.float32)
+    pose_np[:3, :3] = _angles_to_rotation(values[3:])
+    pose_np[:3, 3] = np.asarray(values[:3], dtype=np.float32)
+    return torch.from_numpy(pose_np).to(device)
 
 
 def load_views_from_config(
@@ -146,7 +213,7 @@ def load_views_from_config(
     if "lidar_pose" not in config_data:
         raise ValueError(f"'lidar_pose' missing from {config_path}")
 
-    ego_pose_ue = pose_list_to_matrix(config_data["lidar_pose"], device)
+    ego_pose_ue = cords_to_pose_matrix(config_data["lidar_pose"], device)
     ego_pose_cv = ue_c2w_to_opencv_c2w(ego_pose_ue)
     world_to_ego_cv = torch.inverse(ego_pose_cv)
 
@@ -166,6 +233,7 @@ def load_views_from_config(
         cam_cfg = config_data[cam_name]
         img_path: Optional[Path] = None
         basename = f"{config_stem}_{cam_name}"
+        view_label = f"{config_stem}_{cam_name}"
         for ext in IMAGE_EXTENSIONS:
             candidate = image_dir / f"{basename}{ext}"
             if candidate.exists():
@@ -201,7 +269,7 @@ def load_views_from_config(
             logger.warning("%s has invalid cords length (%d). Skipping.", cam_name, len(cam_pose_list))
             continue
 
-        C2W_ue = pose_list_to_matrix(cam_pose_list, device)
+        C2W_ue = cords_to_pose_matrix(cam_pose_list, device)
         C2W_cv = ue_c2w_to_opencv_c2w(C2W_ue)
         C2E_cv = world_to_ego_cv @ C2W_cv
 
@@ -214,10 +282,13 @@ def load_views_from_config(
         )
         camera_info_list.append(
             {
-                "name": cam_name,
+                "name": view_label,
                 "pose_C2W_cv": C2W_cv.cpu(),
                 "pose_C2E_cv": C2E_cv.cpu(),
                 "image_path": str(img_path),
+                "config_name": config_stem,
+                "config_path": str(config_path),
+                "ego_pose_C2W_cv": ego_pose_cv.cpu(),
             }
         )
 
@@ -226,6 +297,53 @@ def load_views_from_config(
 
     processed_views = preprocess_inputs(raw_views)
     return processed_views, camera_info_list
+
+
+def collect_config_paths(config_path: Path) -> List[Path]:
+    """
+    Expand a file or directory argument into a sorted list of YAML config paths.
+    """
+    if config_path.is_file():
+        if config_path.suffix.lower() not in YAML_EXTENSIONS:
+            raise ValueError(f"Unsupported config extension for {config_path}")
+        return [config_path]
+
+    if config_path.is_dir():
+        yaml_files = sorted(
+            [
+                path
+                for path in config_path.rglob("*")
+                if path.is_file() and path.suffix.lower() in YAML_EXTENSIONS
+            ]
+        )
+        if not yaml_files:
+            raise FileNotFoundError(
+                f"No YAML config files found inside directory: {config_path}"
+            )
+        return yaml_files
+
+    raise FileNotFoundError(f"Config path not found: {config_path}")
+
+
+def load_views_from_configs(
+    config_paths: Iterable[Path], image_dir: Path, device: torch.device
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Load and concatenate views/camera metadata from multiple YAML config files.
+    """
+    all_views: List[Dict[str, Any]] = []
+    all_camera_info: List[Dict[str, Any]] = []
+
+    for cfg_path in config_paths:
+        logger.info("Loading calibrated multi-view inputs from %s", cfg_path)
+        views, camera_info = load_views_from_config(cfg_path, image_dir, device)
+        all_views.extend(views)
+        all_camera_info.extend(camera_info)
+
+    if not all_views:
+        raise ValueError("No valid views could be loaded from the provided configs.")
+
+    return all_views, all_camera_info
 
 
 def _rotation_angle_deg(R_pred: np.ndarray, R_gt: np.ndarray) -> float:
@@ -262,8 +380,50 @@ def _compute_pose_error_metrics(pred_pose: np.ndarray, gt_pose: np.ndarray) -> D
     }
 
 
+def _format_pose_matrix(matrix: np.ndarray, precision: int = 4) -> str:
+    """Pretty-print a pose matrix with consistent precision."""
+    formatter = {"float_kind": lambda val, p=precision: f"{val: .{p}f}"}
+    return np.array2string(matrix, formatter=formatter)
+
+
+def _log_pose_matrices(
+    view_label: str,
+    frame_label: str,
+    pred_abs: np.ndarray,
+    gt_abs: np.ndarray,
+    pred_rel: np.ndarray,
+    gt_rel: np.ndarray,
+    gt_ref_label: str,
+    pred_rel_desc: str,
+    pose_log_sink: Optional[PoseLogSink] = None,
+) -> None:
+    """Log absolute and relative pose matrices for easier inspection."""
+    logger.info("Pose matrices for %s (%s frame, OpenCV convention):", view_label, frame_label)
+    logger.info("  Predicted (absolute):\n%s", _format_pose_matrix(pred_abs))
+    logger.info("  Ground truth (absolute):\n%s", _format_pose_matrix(gt_abs))
+    logger.info("  Predicted (%s):\n%s", pred_rel_desc, _format_pose_matrix(pred_rel))
+    logger.info(
+        "  Ground truth (relative to %s):\n%s",
+        gt_ref_label,
+        _format_pose_matrix(gt_rel),
+    )
+    _maybe_log_lines(
+        pose_log_sink,
+        [
+            f"Pose matrices for {view_label} ({frame_label} frame, OpenCV convention):",
+            f"  Predicted (absolute):\n{_format_pose_matrix(pred_abs)}",
+            f"  Ground truth (absolute):\n{_format_pose_matrix(gt_abs)}",
+            f"  Predicted ({pred_rel_desc}):\n{_format_pose_matrix(pred_rel)}",
+            f"  Ground truth (relative to {gt_ref_label}):\n{_format_pose_matrix(gt_rel)}",
+            "",
+        ],
+    )
+
+
 def log_camera_pose_errors(
-    predictions: List[Dict[str, torch.Tensor]], camera_info_list: List[Dict[str, Any]]
+    predictions: List[Dict[str, torch.Tensor]],
+    camera_info_list: List[Dict[str, Any]],
+    pose_log_sink: Optional[PoseLogSink] = None,
 ) -> None:
     """
     Compare predicted camera poses against YAML-derived poses (both expressed
@@ -272,10 +432,14 @@ def log_camera_pose_errors(
     """
     rows: List[Dict[str, float]] = []
     header = f"{'View':<12}{'AbsTrans(m)':>12}{'RelTrans(%)':>14}{'AbsRot(deg)':>14}{'RelRot(%)':>12}"
-    logger.info("Camera pose errors (predicted vs YAML, relative to view_0):")
+    banner = "Camera pose errors (predicted vs YAML, relative to view_0):"
+    logger.info(banner)
     logger.info(header)
+    _maybe_log_lines(pose_log_sink, [banner, header])
 
     pose_key = "pose_C2W_cv" if "pose_C2W_cv" in camera_info_list[0] else "pose_C2E_cv"
+    pose_frame_label = "C2W" if pose_key == "pose_C2W_cv" else "C2E"
+    ref_view_label = camera_info_list[0].get("name", "view_0")
     gt_ref_pose = camera_info_list[0][pose_key].cpu().numpy()
     gt_ref_pose_inv = np.linalg.inv(gt_ref_pose)
 
@@ -285,6 +449,9 @@ def log_camera_pose_errors(
         if pred_ref_tensor is not None:
             pred_ref_pose = pred_ref_tensor[0].detach().cpu().numpy()
             pred_ref_pose = np.linalg.inv(pred_ref_pose)
+    pred_rel_desc = (
+        f"relative to {ref_view_label}" if pred_ref_pose is not None else "model output frame"
+    )
 
     for idx, cam_info in enumerate(camera_info_list):
         if idx >= len(predictions):
@@ -315,12 +482,26 @@ def log_camera_pose_errors(
         metrics = _compute_pose_error_metrics(pred_pose_rel, gt_pose_rel)
         rows.append(metrics)
 
-        logger.info(
+        row = (
             f"{cam_info.get('name', f'view_{idx}'):<12}"
             f"{metrics['abs_trans']:>12.4f}"
             f"{metrics['rel_trans'] * 100:>14.2f}"
             f"{metrics['abs_rot_deg']:>14.3f}"
             f"{metrics['rel_rot'] * 100:>12.2f}"
+        )
+        logger.info(row)
+        _maybe_log_lines(pose_log_sink, [row])
+
+        _log_pose_matrices(
+            cam_info.get("name", f"view_{idx}"),
+            pose_frame_label,
+            pred_pose_np,
+            gt_pose_np,
+            pred_pose_rel,
+            gt_pose_rel,
+            ref_view_label,
+            pred_rel_desc,
+            pose_log_sink,
         )
 
     if rows:
@@ -328,88 +509,103 @@ def log_camera_pose_errors(
         avg_rel_trans = float(np.mean([r["rel_trans"] for r in rows]))
         avg_abs_rot = float(np.mean([r["abs_rot_deg"] for r in rows]))
         avg_rel_rot = float(np.mean([r["rel_rot"] for r in rows]))
-        logger.info("-" * len(header))
-        logger.info(
+        separator = "-" * len(header)
+        summary = (
             f"{'Average':<12}"
             f"{avg_abs_trans:>12.4f}"
             f"{avg_rel_trans * 100:>14.2f}"
             f"{avg_abs_rot:>14.3f}"
             f"{avg_rel_rot * 100:>12.2f}"
         )
+        logger.info(separator)
+        logger.info(summary)
+        _maybe_log_lines(pose_log_sink, [separator, summary, ""])
 
 
-def read_pcd_with_packed_rgb(file_path):
-    """
-    Reads a .pcd file with RGB data packed into a single float.
-    This logic is adapted from visualize.py to handle the specific format.
-    """
-    # This assumes an ASCII PCD file with a standard 11-line header.
-    try:
-        with open(file_path, 'r') as f:
-            header = [next(f) for _ in range(11)]
-        data = np.loadtxt(file_path, skiprows=11)
-    except Exception as e:
-        logger.error(f"Failed to load .pcd file with numpy from {file_path}: {e}")
-        logger.warning("Falling back to standard Open3D reader.")
-        return o3d.io.read_point_cloud(str(file_path))
-
-    points = data[:, :3]
-    
-    # Check if color information is present
-    if data.shape[1] < 4:
-        logger.warning(f"No color data in {file_path}. Returning colorless point cloud.")
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(points)
-        return pcd
-
-    # Extract and convert packed RGB float to three-channel color
-    rgb_float = data[:, 3].copy()
-    rgb_int_view = rgb_float.view(np.int32)
-    r = (rgb_int_view >> 16) & 0xFF
-    g = (rgb_int_view >> 8) & 0xFF
-    b = rgb_int_view & 0xFF
-    colors = np.vstack([r, g, b]).T / 255.0
-
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points)
-    pcd.colors = o3d.utility.Vector3dVector(colors)
-    return pcd
+def _log_predicted_pose_only(
+    view_label: str,
+    pose_abs: np.ndarray,
+    pose_rel: np.ndarray,
+    rel_ref_label: Optional[str],
+    pose_log_sink: Optional[PoseLogSink] = None,
+) -> None:
+    logger.info("Pose matrices for %s (model output, OpenCV convention):", view_label)
+    logger.info("  Predicted (absolute):\n%s", _format_pose_matrix(pose_abs))
+    rel_desc = f"relative to {rel_ref_label}" if rel_ref_label else "model output frame"
+    logger.info("  Predicted (%s):\n%s", rel_desc, _format_pose_matrix(pose_rel))
+    _maybe_log_lines(
+        pose_log_sink,
+        [
+            f"Pose matrices for {view_label} (model output, OpenCV convention):",
+            f"  Predicted (absolute):\n{_format_pose_matrix(pose_abs)}",
+            f"  Predicted ({rel_desc}):\n{_format_pose_matrix(pose_rel)}",
+            "",
+        ],
+    )
 
 
-def main():
-    """
-    Main function to run model inference and visualize point clouds.
-    """
-    if not OPEN3D_AVAILABLE:
-        logger.error("Error: open3d library is not installed. Please run 'pip install open3d' to install it.")
+def log_predicted_camera_poses(
+    predictions: List[Dict[str, torch.Tensor]],
+    pose_log_sink: Optional[PoseLogSink] = None,
+) -> None:
+    banner = "Predicted camera pose matrices from model outputs (no external config provided):"
+    logger.info(banner)
+    _maybe_log_lines(pose_log_sink, [banner])
+
+    if not predictions:
+        warning_msg = "No predictions were returned; unable to log camera poses."
+        logger.warning(warning_msg)
+        _maybe_log_lines(pose_log_sink, [warning_msg, ""])
         return
 
-    parser = argparse.ArgumentParser(description="Compare predicted point cloud with ground truth from a .pcd file using MapAnything.")
-    parser.add_argument("--image_dir", type=str, required=True, help="Path to the folder containing input images.")
-    parser.add_argument("--config_path", type=str, default=None, help="Optional YAML config describing calibrated camera poses and intrinsics.")
-    parser.add_argument("--gt_pcd_path", type=str, required=True, help="Path to the ground truth point cloud file (.pcd format).")
-    parser.add_argument("--memory_efficient", action="store_true", help="Use memory-efficient mode for inference (slower).")
-    parser.add_argument("--checkpoint_path", type=str, default="checkpoint-best.pth", help="Local MapAnything checkpoint to load (.pth or .safetensors).")
-    parser.add_argument("--hydra_config_path", type=str, default="configs/train.yaml", help="Hydra config used to instantiate the model.")
-    parser.add_argument("--config_json_path", type=str, default="scripts/local_models/config.json", help="Optional model config JSON describing encoder/heads.")
-    parser.add_argument(
-        "--config_overrides",
-        nargs="*",
-        default=None,
-        help="Optional Hydra overrides (defaults target the released MapAnything model).",
-    )
-    parser.add_argument("--strict_load", action="store_true", help="Enable strict checkpoint loading.")
-    parser.add_argument("--no_viz", action="store_true", help="Disable Open3D visualization (useful for headless runs).")
-    parser.add_argument("--save_pred_path", type=str, default=None, help="Optional path to save aggregated predicted point cloud (.pcd/.ply).")
-    args = parser.parse_args()
+    pred_ref_pose = None
+    if predictions[0].get("camera_poses") is not None:
+        pred_ref_pose = predictions[0]["camera_poses"][0].detach().cpu().numpy()
+        try:
+            pred_ref_pose = np.linalg.inv(pred_ref_pose)
+        except np.linalg.LinAlgError as exc:
+            warning_msg = f"Failed to invert reference pose for relative logging: {exc}."
+            logger.warning(warning_msg)
+            _maybe_log_lines(pose_log_sink, [warning_msg])
+            pred_ref_pose = None
+    else:
+        warning_msg = (
+            "Prediction view_0 missing 'camera_poses'; relative predicted poses will "
+            "be reported in the model output frame."
+        )
+        logger.warning(warning_msg)
+        _maybe_log_lines(pose_log_sink, [warning_msg])
 
-    image_dir = Path(args.image_dir)
-    gt_pcd_path = Path(args.gt_pcd_path)
-    checkpoint_path = Path(args.checkpoint_path)
-    hydra_config_path = Path(args.hydra_config_path)
-    config_json_path = Path(args.config_json_path)
-    config_path = Path(args.config_path) if args.config_path else None
+    for idx, pred in enumerate(predictions):
+        pose_tensor = pred.get("camera_poses")
+        view_label = pred.get("view_name", f"view_{idx}")
+        if pose_tensor is None:
+            msg = f"Prediction {view_label} missing 'camera_poses'; skipping."
+            logger.warning(msg)
+            _maybe_log_lines(pose_log_sink, [msg])
+            continue
 
+        pose_abs = pose_tensor[0].detach().cpu().numpy()
+        if pred_ref_pose is not None:
+            pose_rel = pred_ref_pose @ pose_abs
+            rel_label = predictions[0].get("view_name", "view_0")
+        else:
+            pose_rel = pose_abs
+            rel_label = None
+
+        _log_predicted_pose_only(view_label, pose_abs, pose_rel, rel_label, pose_log_sink)
+
+
+def _run_color_compare(
+    args: argparse.Namespace,
+    image_dir: Path,
+    gt_pcd_path: Path,
+    checkpoint_path: Path,
+    hydra_config_path: Path,
+    config_json_path: Path,
+    config_input_path: Optional[Path],
+    pose_log_sink: PoseLogSink,
+) -> None:
     if not image_dir.is_dir():
         raise FileNotFoundError(f"Image folder not found: {image_dir}")
     if not gt_pcd_path.is_file():
@@ -421,8 +617,9 @@ def main():
     if not config_json_path.is_file():
         raise FileNotFoundError(f"Config JSON not found: {config_json_path}")
 
-    if config_path and not config_path.is_file():
-        raise FileNotFoundError(f"Camera config not found: {config_path}")
+    config_paths: List[Path] = []
+    if config_input_path is not None:
+        config_paths = collect_config_paths(config_input_path)
 
     # --- Model Loading and Inference ---
     logger.info("Loading MapAnything model...")
@@ -446,10 +643,18 @@ def main():
     model = initialize_mapanything_local(local_config, device)
     model.eval()
 
-    if config_path:
-        logger.info("Loading calibrated multi-view inputs from %s", config_path)
-        views, camera_info_list = load_views_from_config(config_path, image_dir, device)
-        logger.info("Loaded %d calibrated views using external poses.", len(views))
+    if config_paths:
+        logger.info("Loading calibrated multi-view inputs from %d config(s).", len(config_paths))
+        views, camera_info_list = load_views_from_configs(config_paths, image_dir, device)
+        logger.info(
+            "Loaded %d calibrated views using %d external config(s).",
+            len(views),
+            len(config_paths),
+        )
+        strip_external_calibration_inputs(views)
+        logger.info(
+            "Stripped external intrinsics/pose inputs from views to keep inference strictly image-only."
+        )
     else:
         camera_info_list = None
         logger.info(f"Loading images from '{image_dir}'...")
@@ -462,24 +667,51 @@ def main():
     logger.info("Inference complete.")
 
     if using_external_poses:
-        log_camera_pose_errors(predictions, camera_info_list)
+        log_camera_pose_errors(predictions, camera_info_list, pose_log_sink)
+    else:
+        log_predicted_camera_poses(predictions, pose_log_sink)
 
     # --- Extract Prediction Results (aggregate point cloud) ---
     aggregated_points: List[np.ndarray] = []
     aggregated_colors: List[np.ndarray] = []
 
-    T_CV_TO_UE = np.array(
-        [
-            [0.0, 0.0, 1.0, 0.0],
-            [1.0, 0.0, 0.0, 0.0],
-            [0.0, -1.0, 0.0, 0.0],
-            [0.0, 0.0, 0.0, 1.0],
-        ],
-        dtype=np.float32,
-    )
-    R_CV_TO_UE = T_CV_TO_UE[:3, :3]
+    T_CV_TO_UE = CV_TO_UE_TRANSFORM
+    R_CV_TO_UE = CV_TO_UE_ROTATION
+
+    use_world_frame = False
+    if config_paths:
+        if args.aggregate_frame == "world":
+            use_world_frame = True
+        elif args.aggregate_frame == "ego":
+            use_world_frame = False
+        else:
+            use_world_frame = len(config_paths) > 1
+
+    ref_world_to_ego_cv: Optional[np.ndarray] = None
+    ref_config_label: Optional[str] = None
+    if use_world_frame and camera_info_list:
+        for info in camera_info_list:
+            ego_pose_tensor = info.get("ego_pose_C2W_cv")
+            if ego_pose_tensor is None:
+                continue
+            ego_pose_np = ego_pose_tensor.detach().cpu().numpy()
+            if ego_pose_np.shape != (4, 4):
+                continue
+            ref_world_to_ego_cv = np.linalg.inv(ego_pose_np)
+            ref_config_label = info.get("config_name") or Path(info.get("config_path", "")).stem
+            break
+        if ref_world_to_ego_cv is not None:
+            logger.info(
+                "Anchoring fused world points to ego frame from config '%s'.",
+                ref_config_label or "unknown",
+            )
+        else:
+            logger.warning("Failed to find ego pose for anchoring. Keeping global world coordinates.")
 
     if using_external_poses:
+        frame_desc = "world" if use_world_frame else "ego"
+        logger.info("Aggregating predicted points in %s frame.", frame_desc)
+
         if len(camera_info_list) != len(predictions):
             logger.warning(
                 "Camera info count (%d) does not match predictions (%d).",
@@ -532,34 +764,47 @@ def main():
             colors_flat = img_np.reshape(-1, 3)
             colors_masked = colors_flat[mask_flat]
 
-            pts_cam_hom = np.hstack(
-                (pts_masked, np.ones((pts_masked.shape[0], 1), dtype=pts_masked.dtype))
+            pts_cam_hom = np.hstack((pts_masked, np.ones((pts_masked.shape[0], 1), dtype=pts_masked.dtype)))
+            pose_matrix = (
+                cam_info["pose_C2W_cv"].numpy() if use_world_frame else cam_info["pose_C2E_cv"].numpy()
             )
-            pose_c2e_cv = cam_info["pose_C2E_cv"].numpy()
-            pts_ego_cv = (pose_c2e_cv @ pts_cam_hom.T).T[:, :3]
+            pts_target_cv = (pose_matrix @ pts_cam_hom.T).T[:, :3]
+            if use_world_frame and ref_world_to_ego_cv is not None:
+                pts_target_cv_hom = np.hstack(
+                    (pts_target_cv, np.ones((pts_target_cv.shape[0], 1), dtype=pts_target_cv.dtype))
+                )
+                pts_target_cv = (ref_world_to_ego_cv @ pts_target_cv_hom.T).T[:, :3]
 
-            if colors_masked.shape[0] == pts_ego_cv.shape[0]:
+            if colors_masked.shape[0] == pts_target_cv.shape[0]:
                 if colors_masked.max() > 1.0:
                     colors_masked = colors_masked / 255.0
+                if use_world_frame:
+                    if ref_world_to_ego_cv is not None:
+                        chunk_label = f"ref-ego({ref_config_label})" if ref_config_label else "ref-ego"
+                    else:
+                        chunk_label = "global"
+                else:
+                    chunk_label = "ego"
                 logger.info(
-                    "Applied colors to fused ego point chunk for %s (%d points).",
+                    "Applied colors to fused %s point chunk for %s (%d points).",
+                    chunk_label,
                     view_label,
-                    pts_ego_cv.shape[0],
+                    pts_target_cv.shape[0],
                 )
             else:
                 logger.warning(
                     "Color mismatch for %s (points=%d, colors=%d). Using blue.",
                     view_label,
-                    pts_ego_cv.shape[0],
+                    pts_target_cv.shape[0],
                     colors_masked.shape[0],
                 )
-                colors_masked = np.tile(np.array([[0.0, 0.0, 1.0]]), (pts_ego_cv.shape[0], 1))
+                colors_masked = np.tile(np.array([[0.0, 0.0, 1.0]]), (pts_target_cv.shape[0], 1))
 
-            pts_ego_cv_hom = np.hstack(
-                (pts_ego_cv, np.ones((pts_ego_cv.shape[0], 1), dtype=pts_ego_cv.dtype))
+            pts_target_cv_hom = np.hstack(
+                (pts_target_cv, np.ones((pts_target_cv.shape[0], 1), dtype=pts_target_cv.dtype))
             )
-            pts_ego_ue = (T_CV_TO_UE @ pts_ego_cv_hom.T).T[:, :3]
-            aggregated_points.append(pts_ego_ue)
+            pts_target_ue = (T_CV_TO_UE @ pts_target_cv_hom.T).T[:, :3]
+            aggregated_points.append(pts_target_ue)
             aggregated_colors.append(colors_masked)
     else:
         for i, pred in enumerate(predictions):
@@ -581,9 +826,7 @@ def main():
             else:
                 mask_flat = None
 
-            points_filtered = (
-                points_flat if mask_flat is None else points_flat[mask_flat]
-            )
+            points_filtered = points_flat if mask_flat is None else points_flat[mask_flat]
             if points_filtered.size == 0:
                 logger.warning("No valid points for view %d. Skipping point cloud.", i)
                 continue
@@ -596,9 +839,7 @@ def main():
                 img_np = rgb(view_tensor, norm_type=norm_type)[0]
 
             colors_flat = img_np.reshape(-1, 3)
-            colors_filtered = (
-                colors_flat if mask_flat is None else colors_flat[mask_flat]
-            )
+            colors_filtered = colors_flat if mask_flat is None else colors_flat[mask_flat]
 
             if colors_filtered.shape[0] == points_filtered.shape[0]:
                 if colors_filtered.max() > 1.0:
@@ -615,9 +856,7 @@ def main():
                     points_filtered.shape[0],
                     colors_filtered.shape[0],
                 )
-                colors_filtered = np.tile(
-                    np.array([[0.0, 0.0, 1.0]]), (points_filtered.shape[0], 1)
-                )
+                colors_filtered = np.tile(np.array([[0.0, 0.0, 1.0]]), (points_filtered.shape[0], 1))
 
             # Rotate OpenCV-style world predictions into the UE/ego convention
             points_filtered_ue = points_filtered @ R_CV_TO_UE.T
@@ -630,6 +869,23 @@ def main():
 
     points_pred = np.concatenate(aggregated_points, axis=0)
     colors_pred = np.concatenate(aggregated_colors, axis=0)
+
+    if args.max_height is not None:
+        height_mask = points_pred[:, 2] <= args.max_height
+        removed_points = int((~height_mask).sum())
+        if removed_points > 0:
+            logger.info(
+                "Removed %d predicted points above max height %.2f m.",
+                removed_points,
+                args.max_height,
+            )
+        points_pred = points_pred[height_mask]
+        if colors_pred.shape[0] == height_mask.shape[0]:
+            colors_pred = colors_pred[height_mask]
+
+    if points_pred.size == 0:
+        logger.error("All predicted points were filtered out. Nothing to save or visualize.")
+        return
 
     pcd_pred = o3d.geometry.PointCloud()
     pcd_pred.points = o3d.utility.Vector3dVector(points_pred)
@@ -664,16 +920,38 @@ def main():
     if pcd_gt is None or not pcd_gt.has_points():
         logger.error("Failed to load ground truth point cloud or it is empty.")
         return
-    
+
     if not pcd_gt.has_colors():
         logger.warning("Ground truth point cloud does not have colors. Painting it green.")
-        pcd_gt.paint_uniform_color([0, 1, 0]) # Green
+        pcd_gt.paint_uniform_color([0, 1, 0])  # Green
 
     logger.info(f"Successfully loaded ground truth point cloud with {len(pcd_gt.points)} points.")
 
     if args.no_viz:
         logger.info("Skipping visualization as requested (--no_viz).")
         return
+
+    camera_pose_visuals, camera_pose_counts = build_camera_pose_visuals(predictions, camera_info_list)
+    camera_pose_geoms = camera_pose_visuals.get("predicted", []) + camera_pose_visuals.get(
+        "ground_truth", []
+    )
+    if camera_pose_counts.get("predicted"):
+        logger.info(
+            "Visualizing %d predicted camera pose(s) (blue frustums).",
+            camera_pose_counts["predicted"],
+        )
+    elif predictions:
+        logger.warning("Model output did not include camera poses to visualize.")
+
+    if camera_pose_counts.get("ground_truth"):
+        logger.info(
+            "Visualizing %d ground truth camera pose(s) (green frustums).",
+            camera_pose_counts["ground_truth"],
+        )
+    elif camera_info_list:
+        logger.warning(
+            "Camera configs were provided but ground truth poses were missing; only predicted poses will be shown."
+        )
 
     # --- Visualization ---
     logger.info("Creating visualization windows (predicted vs ground truth)...")
@@ -687,6 +965,8 @@ def main():
         top=40,
     )
     vis_pred.add_geometry(pcd_pred)
+    for geom in camera_pose_geoms:
+        vis_pred.add_geometry(geom)
 
     vis_gt = o3d.visualization.Visualizer()
     vis_gt.create_window(
@@ -710,6 +990,289 @@ def main():
         vis_pred.destroy_window()
         vis_gt.destroy_window()
         logger.info("Visualization windows closed.")
+def _extract_pose_numpy(pose_value: Any) -> Optional[np.ndarray]:
+    """Convert a tensor/array pose into a float64 numpy matrix."""
+    if pose_value is None:
+        return None
+
+    if torch.is_tensor(pose_value):
+        pose_arr = pose_value.detach().cpu().numpy()
+    elif isinstance(pose_value, np.ndarray):
+        pose_arr = np.array(pose_value, copy=True)
+    elif isinstance(pose_value, (list, tuple)):
+        pose_arr = np.asarray(pose_value, dtype=np.float64)
+    else:
+        return None
+
+    if pose_arr.ndim == 3:
+        if pose_arr.shape[0] == 0:
+            return None
+        pose_arr = pose_arr[0]
+
+    if pose_arr.shape != (4, 4):
+        logger.warning("Pose has invalid shape %s (expected 4x4).", pose_arr.shape)
+        return None
+
+    return pose_arr.astype(np.float64)
+
+
+def _align_predicted_camera_poses(
+    pred_pose_list: List[np.ndarray], gt_pose_list: List[np.ndarray]
+) -> List[np.ndarray]:
+    """Align predicted poses with ground truth when available."""
+    if not pred_pose_list:
+        return []
+
+    if not gt_pose_list:
+        return list(pred_pose_list)
+
+    try:
+        alignment = gt_pose_list[0] @ np.linalg.inv(pred_pose_list[0])
+    except np.linalg.LinAlgError as exc:
+        logger.warning("Failed to align predicted camera poses: %s", exc)
+        return list(pred_pose_list)
+
+    return [alignment @ pose for pose in pred_pose_list]
+
+
+def _cv_pose_to_ue(pose: np.ndarray) -> np.ndarray:
+    """Convert a camera pose from OpenCV coordinates into the UE convention."""
+    return (CV_TO_UE_TRANSFORM @ pose).astype(np.float64)
+
+
+def _create_frustum_geometry(
+    pose: np.ndarray,
+    color: Tuple[float, float, float],
+    scale: float,
+    marker_radius: float,
+) -> List[Any]:
+    """Create a frustum plus marker for a single camera pose."""
+    if not OPEN3D_AVAILABLE:
+        return []
+
+    half_w = 0.35 * scale
+    half_h = 0.25 * scale
+    depth = 0.8 * scale
+
+    points_cam = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [-half_w, -half_h, depth],
+            [half_w, -half_h, depth],
+            [half_w, half_h, depth],
+            [-half_w, half_h, depth],
+        ],
+        dtype=np.float64,
+    )
+    homog = np.hstack((points_cam, np.ones((points_cam.shape[0], 1), dtype=np.float64)))
+    points_world = (pose @ homog.T).T[:, :3]
+
+    lines = np.array(
+        [
+            [0, 1],
+            [0, 2],
+            [0, 3],
+            [0, 4],
+            [1, 2],
+            [2, 3],
+            [3, 4],
+            [4, 1],
+        ],
+        dtype=np.int32,
+    )
+    line_colors = np.tile(np.asarray(color, dtype=np.float64), (lines.shape[0], 1))
+
+    frustum = o3d.geometry.LineSet()
+    frustum.points = o3d.utility.Vector3dVector(points_world)
+    frustum.lines = o3d.utility.Vector2iVector(lines)
+    frustum.colors = o3d.utility.Vector3dVector(line_colors)
+
+    marker = o3d.geometry.TriangleMesh.create_sphere(radius=marker_radius)
+    marker.paint_uniform_color(color)
+    marker.translate(points_world[0])
+
+    return [frustum, marker]
+
+
+def _build_camera_pose_geoms(
+    pose_list: List[np.ndarray],
+    color: Tuple[float, float, float],
+    scale: float,
+    marker_radius: float,
+) -> List[Any]:
+    visuals: List[Any] = []
+    for pose in pose_list:
+        visuals.extend(_create_frustum_geometry(pose, color, scale, marker_radius))
+    return visuals
+
+
+def build_camera_pose_visuals(
+    predictions: List[Dict[str, torch.Tensor]],
+    camera_info_list: Optional[List[Dict[str, Any]]],
+) -> Tuple[Dict[str, List[Any]], Dict[str, int]]:
+    """Prepare Open3D geometries that visualize predicted/ground-truth camera poses."""
+    visuals: Dict[str, List[Any]] = {"predicted": [], "ground_truth": []}
+    counts = {"predicted": 0, "ground_truth": 0}
+
+    if not OPEN3D_AVAILABLE:
+        return visuals, counts
+
+    pred_pose_list: List[np.ndarray] = []
+    for pred in predictions:
+        pose_np = _extract_pose_numpy(pred.get("camera_poses"))
+        if pose_np is not None:
+            pred_pose_list.append(pose_np)
+    counts["predicted"] = len(pred_pose_list)
+
+    gt_pose_list: List[np.ndarray] = []
+    if camera_info_list:
+        for cam_info in camera_info_list:
+            pose_value = cam_info.get("pose_C2E_cv")
+            if pose_value is None:
+                pose_value = cam_info.get("pose_C2W_cv")
+            pose_np = _extract_pose_numpy(pose_value)
+            if pose_np is not None:
+                gt_pose_list.append(pose_np)
+    counts["ground_truth"] = len(gt_pose_list)
+
+    pred_pose_aligned = _align_predicted_camera_poses(pred_pose_list, gt_pose_list)
+
+    pred_pose_ue = [_cv_pose_to_ue(pose) for pose in pred_pose_aligned]
+    gt_pose_ue = [_cv_pose_to_ue(pose) for pose in gt_pose_list]
+
+    if pred_pose_ue:
+        visuals["predicted"] = _build_camera_pose_geoms(
+            pred_pose_ue, (0.2, 0.4, 1.0), 1.1, 0.08
+        )
+    if gt_pose_ue:
+        visuals["ground_truth"] = _build_camera_pose_geoms(
+            gt_pose_ue, (0.1, 0.8, 0.3), 0.9, 0.07
+        )
+
+    return visuals, counts
+
+
+def read_pcd_with_packed_rgb(file_path):
+    """
+    Reads a .pcd file with RGB data packed into a single float.
+    This logic is adapted from visualize.py to handle the specific format.
+    """
+    # This assumes an ASCII PCD file with a standard 11-line header.
+    try:
+        with open(file_path, 'r') as f:
+            header = [next(f) for _ in range(11)]
+        data = np.loadtxt(file_path, skiprows=11)
+    except Exception as e:
+        logger.error(f"Failed to load .pcd file with numpy from {file_path}: {e}")
+        logger.warning("Falling back to standard Open3D reader.")
+        return o3d.io.read_point_cloud(str(file_path))
+
+    points = data[:, :3]
+    
+    # Check if color information is present
+    if data.shape[1] < 4:
+        logger.warning(f"No color data in {file_path}. Returning colorless point cloud.")
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points)
+        return pcd
+
+    # Extract and convert packed RGB float to three-channel color
+    rgb_float = data[:, 3].copy()
+    rgb_int_view = rgb_float.view(np.int32)
+    r = (rgb_int_view >> 16) & 0xFF
+    g = (rgb_int_view >> 8) & 0xFF
+    b = rgb_int_view & 0xFF
+    colors = np.vstack([r, g, b]).T / 255.0
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+    pcd.colors = o3d.utility.Vector3dVector(colors)
+    return pcd
+
+
+def main():
+    """
+    Main function to run model inference and visualize point clouds.
+    """
+    if not OPEN3D_AVAILABLE:
+        logger.error("Error: open3d library is not installed. Please run 'pip install open3d' to install it.")
+        return
+
+    parser = argparse.ArgumentParser(description="Compare predicted point cloud with ground truth from a .pcd file using MapAnything.")
+    parser.add_argument("--image_dir", type=str, required=True, help="Path to the folder containing input images.")
+    parser.add_argument(
+        "--config_path",
+        type=str,
+        default=None,
+        help="Path to a YAML config file or a directory containing multiple YAML configs.",
+    )
+    parser.add_argument("--gt_pcd_path", type=str, required=True, help="Path to the ground truth point cloud file (.pcd format).")
+    parser.add_argument("--memory_efficient", action="store_true", help="Use memory-efficient mode for inference (slower).")
+    parser.add_argument("--checkpoint_path", type=str, default="checkpoint-best.pth", help="Local MapAnything checkpoint to load (.pth or .safetensors).")
+    parser.add_argument("--hydra_config_path", type=str, default="configs/train.yaml", help="Hydra config used to instantiate the model.")
+    parser.add_argument("--config_json_path", type=str, default="scripts/local_models/config.json", help="Optional model config JSON describing encoder/heads.")
+    parser.add_argument(
+        "--aggregate_frame",
+        choices=["auto", "ego", "world"],
+        default="auto",
+        help=(
+            "Coordinate frame to aggregate predicted points when external poses are provided. "
+            "'auto' keeps the old ego-centric behavior for a single config and switches to the "
+            "global world frame when multiple configs are used."
+        ),
+    )
+    parser.add_argument(
+        "--config_overrides",
+        nargs="*",
+        default=None,
+        help="Optional Hydra overrides (defaults target the released MapAnything model).",
+    )
+    parser.add_argument("--strict_load", action="store_true", help="Enable strict checkpoint loading.")
+    parser.add_argument("--no_viz", action="store_true", help="Disable Open3D visualization (useful for headless runs).")
+    parser.add_argument("--save_pred_path", type=str, default=None, help="Optional path to save aggregated predicted point cloud (.pcd/.ply).")
+    parser.add_argument(
+        "--max_height",
+        type=float,
+        default=2.0,
+        help="Discard predicted points above this Z height (in meters) before saving or visualizing.",
+    )
+    parser.add_argument(
+        "--pose_log_path",
+        type=str,
+        default="color_compare_pose_log.txt",
+        help="File to store pose matrices/errors. Provide an empty string to disable file logging.",
+    )
+    args = parser.parse_args()
+
+    image_dir = Path(args.image_dir)
+    gt_pcd_path = Path(args.gt_pcd_path)
+    checkpoint_path = Path(args.checkpoint_path)
+    hydra_config_path = Path(args.hydra_config_path)
+    config_json_path = Path(args.config_json_path)
+    config_input_path = Path(args.config_path).expanduser() if args.config_path else None
+    pose_log_path = Path(args.pose_log_path).expanduser() if args.pose_log_path else None
+
+    pose_log_sink = PoseLogSink(pose_log_path)
+    command_line = " ".join(shlex.quote(arg) for arg in sys.argv)
+    logger.info("记录当前运行命令：%s", command_line)
+    if pose_log_path:
+        logger.info("位姿日志将附加写入：%s", pose_log_path)
+    else:
+        logger.info("未设置 --pose_log_path，位姿信息仅会在终端输出。")
+    pose_log_sink.log_run_header(command_line)
+    try:
+        _run_color_compare(
+            args,
+            image_dir,
+            gt_pcd_path,
+            checkpoint_path,
+            hydra_config_path,
+            config_json_path,
+            config_input_path,
+            pose_log_sink,
+        )
+    finally:
+        pose_log_sink.close()
 
 
 if __name__ == "__main__":
