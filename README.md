@@ -1,4 +1,7 @@
 # MapAnything FT（多车圆柱融合分支）
+> Project: coopVGGT | Role: Core image-only 3D / OPV2V | Status: active
+> Primary docs: docs/ (within repo) + vggt_series_4_coop/docs/project_overview.md
+
 
 > 更新时间：2025-12-07 03:35 UTC
 
